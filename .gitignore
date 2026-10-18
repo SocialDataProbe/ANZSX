@@ -1,0 +1,21 @@
+# Turso URL and token. Put them in Streamlit Cloud's Secrets instead.
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Private plans, design notes and Claude Code guidance. Keep them local.
+docs/
+CLAUDE.md
+
+# Downloaded or resumed results
+*.csv
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

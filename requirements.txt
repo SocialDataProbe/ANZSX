@@ -1,0 +1,5 @@
+# Pinned to the versions the app was tested with. Change them on purpose, not by accident.
+anthropic==1.8.0
+streamlit==1.40.2
+typesafe-sdk==0.7.2
+libsql==0.1.11
