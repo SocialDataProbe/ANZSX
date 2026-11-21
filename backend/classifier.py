@@ -141,23 +141,41 @@ def extract_text(response) -> tuple[str, str]:
     return content_text, thinking_text
 
 
-async def run_trial(
+FALLBACK_MODEL = "claude-sonnet-5"
+
+
+def _error_result(sample: dict, model: str, message: str, start: float) -> dict:
+    return {
+        "rowid": sample["rowid"],
+        "company_name": sample["company_name"],
+        "year": sample["year"],
+        "section_name": sample["section_name"],
+        "country": sample.get("country", ""),
+        "source_text": sample["content"],
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "result": None,
+        "raw_response": None,
+        "model_used": model,
+        "status": "error",
+        "error": message,
+        "latency_ms": int((time.time() - start) * 1000),
+    }
+
+
+async def _classify_many(
+    client,
     samples: list[dict],
     model: str,
     task: str,
-    rules: list[str] | None = None,
-    taxonomy: list[dict] | None = None,
-    thinking_effort: str = "high",
-    *,
-    api_key: str,
-    trial_store: dict,
-) -> dict:
-    client = anthropic.AsyncAnthropic(api_key=api_key)
-    semaphore = asyncio.Semaphore(5)
-    system_prompt = build_system_prompt()
-    schema = build_json_schema(taxonomy) if taxonomy else None
-
-    FALLBACK_MODEL = "claude-sonnet-5"
+    rules: list[str] | None,
+    taxonomy: list[dict] | None,
+    thinking_effort: str,
+    system_prompt: str,
+    schema: dict | None,
+    semaphore: asyncio.Semaphore,
+) -> list[dict]:
+    """Classify the samples at the same time (limited by the semaphore). Keeps input order."""
 
     async def _call_model(sample: dict, use_model: str) -> dict:
         params = build_request_params(
@@ -166,7 +184,6 @@ async def run_trial(
         )
         response = await client.messages.create(**params)
         content_text, thinking_text = extract_text(response)
-
         return {
             "response": response,
             "content_text": content_text,
@@ -180,64 +197,19 @@ async def run_trial(
             try:
                 result = await _call_model(sample, model)
             except anthropic.BadRequestError as e:
-                if model != FALLBACK_MODEL:
-                    try:
-                        result = await _call_model(sample, FALLBACK_MODEL)
-                    except Exception as retry_e:
-                        return {
-                            "rowid": sample["rowid"],
-                            "company_name": sample["company_name"],
-                            "year": sample["year"],
-                            "section_name": sample["section_name"],
-                            "country": sample.get("country", ""),
-                            "source_text": sample["content"],
-                            "input_tokens": 0,
-                            "output_tokens": 0,
-                            "result": None,
-                            "raw_response": None,
-                            "model_used": FALLBACK_MODEL,
-                            "status": "error",
-                            "error": f"Fallback ({FALLBACK_MODEL}) also failed: {retry_e}",
-                            "latency_ms": int((time.time() - start) * 1000),
-                        }
-                else:
-                    return {
-                        "rowid": sample["rowid"],
-                        "company_name": sample["company_name"],
-                        "year": sample["year"],
-                        "section_name": sample["section_name"],
-                        "country": sample.get("country", ""),
-                        "source_text": sample["content"],
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "result": None,
-                        "raw_response": None,
-                        "model_used": model,
-                        "status": "error",
-                        "error": str(e),
-                        "latency_ms": int((time.time() - start) * 1000),
-                    }
+                if model == FALLBACK_MODEL:
+                    return _error_result(sample, model, str(e), start)
+                try:
+                    result = await _call_model(sample, FALLBACK_MODEL)
+                except Exception as retry_e:
+                    return _error_result(
+                        sample, FALLBACK_MODEL,
+                        f"Fallback ({FALLBACK_MODEL}) also failed: {retry_e}", start,
+                    )
             except Exception as e:
-                return {
-                    "rowid": sample["rowid"],
-                    "company_name": sample["company_name"],
-                    "year": sample["year"],
-                    "section_name": sample["section_name"],
-                    "country": sample.get("country", ""),
-                    "source_text": sample["content"],
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "result": None,
-                    "raw_response": None,
-                    "model_used": model,
-                    "status": "error",
-                    "error": str(e),
-                    "latency_ms": int((time.time() - start) * 1000),
-                }
+                return _error_result(sample, model, str(e), start)
 
             response = result["response"]
-            result_data = _parse_json_response(result["content_text"])
-
             return {
                 "rowid": sample["rowid"],
                 "company_name": sample["company_name"],
@@ -247,7 +219,7 @@ async def run_trial(
                 "source_text": sample["content"],
                 "input_tokens": response.usage.input_tokens,
                 "output_tokens": response.usage.output_tokens,
-                "result": result_data,
+                "result": _parse_json_response(result["content_text"]),
                 "raw_response": result["content_text"],
                 "thinking_text": result["thinking_text"],
                 "model_used": result["model_used"],
@@ -256,7 +228,34 @@ async def run_trial(
                 "latency_ms": int((time.time() - start) * 1000),
             }
 
-    results = await asyncio.gather(*[process_one(s) for s in samples])
+    return list(await asyncio.gather(*[process_one(s) for s in samples]))
+
+
+def _total_cost(results: list[dict], model: str) -> float:
+    return round(sum(
+        estimate_single_cost(r["input_tokens"], r["output_tokens"], r.get("model_used", model))
+        for r in results
+        if r["status"] == "success"
+    ), 6)
+
+
+async def run_trial(
+    samples: list[dict],
+    model: str,
+    task: str,
+    rules: list[str] | None = None,
+    taxonomy: list[dict] | None = None,
+    thinking_effort: str = "high",
+    *,
+    api_key: str,
+    trial_store: dict,
+) -> dict:
+    client = anthropic.AsyncAnthropic(api_key=api_key)
+    schema = build_json_schema(taxonomy) if taxonomy else None
+    results = await _classify_many(
+        client, samples, model, task, rules, taxonomy, thinking_effort,
+        build_system_prompt(), schema, asyncio.Semaphore(5),
+    )
 
     trial_id = f"trial_{uuid4().hex[:12]}"
     trial_store[trial_id] = {
@@ -269,18 +268,172 @@ async def run_trial(
         "raw_samples": samples,
     }
 
-    total_cost = sum(
-        estimate_single_cost(r["input_tokens"], r["output_tokens"], r.get("model_used", model))
-        for r in results
-        if r["status"] == "success"
-    )
-
     return {
         "trial_id": trial_id,
         "samples": list(results),
-        "total_cost_usd": round(total_cost, 6),
+        "total_cost_usd": _total_cost(results, model),
         "success_count": sum(1 for r in results if r["status"] == "success"),
         "error_count": sum(1 for r in results if r["status"] == "error"),
+    }
+
+
+# ── Targeted sample (top-N keyword search) ──
+
+SEARCH_TERMS_MODEL = "claude-haiku-5-5"
+TARGETED_GROUP_SIZE = 5
+
+STOP_FOUND_ALL = "found all hits"
+STOP_MAX_REPORTS = "reached the maximum number of reports"
+STOP_NO_MORE = "no more matching reports"
+
+_SEARCH_TERMS_SCHEMA = {
+    "type": "object",
+    "properties": {"terms": {"type": "array", "items": {"type": "string"}}},
+    "required": ["terms"],
+    "additionalProperties": False,
+}
+
+
+async def make_search_terms(task: str, field: dict, values: list[str], *, api_key: str) -> list[str]:
+    """Keywords for the BM25 search. The hit values are always included.
+    If the call fails, the hit values and the field name are the only terms."""
+    fallback = list(values) + [field["code"].replace("_", " ")]
+    cats = {c["name"]: c.get("description", "") for c in field.get("categories", [])}
+    if values:
+        wanted = "\n".join(f"- {v}" + (f": {cats[v]}" if cats.get(v) else "") for v in values)
+    else:
+        wanted = "- Any report that gives a clear answer for this field."
+    prompt = (
+        "We search sections of ASX/NZX company annual reports with a keyword (BM25) search. "
+        "We want the reports that are most likely to match the description below.\n\n"
+        f"Task given to the classifier:\n{task}\n\n"
+        f"Field: {field['code']}\n"
+        f"Field definition: {field.get('definition', '')}\n\n"
+        f"Values we want to find:\n{wanted}\n\n"
+        "Give 10 to 30 search terms that such a report is likely to contain: words and short "
+        "phrases (1 to 4 words) with the same meaning, short forms, and closely related words. "
+        "Use plain words only, with no search operators. Do not include words that almost "
+        "every annual report contains."
+    )
+    try:
+        client = anthropic.AsyncAnthropic(api_key=api_key)
+        response = await client.messages.create(
+            model=SEARCH_TERMS_MODEL,
+            max_tokens=2000,
+            output_config={
+                "effort": "low",
+                "format": {"type": "json_schema", "schema": _SEARCH_TERMS_SCHEMA},
+            },
+            messages=[{"role": "user", "content": prompt}],
+        )
+        content_text, _ = extract_text(response)
+        data = _parse_json_response(content_text)
+        terms = data.get("terms", []) if isinstance(data, dict) else []
+        terms = [str(t) for t in terms if str(t).strip()]
+    except Exception:
+        terms = []
+    return list(values) + terms if terms else fallback
+
+
+def is_hit(result: dict, field: str, values: list[str]) -> bool:
+    """A hit = a successful result whose field has one of the values. With no values
+    (a field with no categories), any answer except Don't Know or empty is a hit."""
+    if result.get("status") != "success" or not isinstance(result.get("result"), dict):
+        return False
+    answer = str(result["result"].get(field, "") or "").strip()
+    if values:
+        return answer in values
+    return answer not in ("", "Don't Know")
+
+
+async def run_targeted(
+    ranked: list[dict],
+    hit_field: str,
+    hit_values: list[str],
+    n_hits: int,
+    max_reports: int,
+    model: str,
+    task: str,
+    rules: list[str] | None = None,
+    taxonomy: list[dict] | None = None,
+    thinking_effort: str = "high",
+    *,
+    api_key: str,
+    trial_store: dict,
+    get_records,
+    skip_rowids=(),
+) -> dict:
+    """Classify the ranked reports in groups, best match first. Stop when n_hits hits are
+    found, max_reports reports are read, or no ranked reports are left.
+
+    get_records(rowids) returns {rowid: record with content}. The trial_store entry and
+    the returned "samples" hold the hits only. "all_results" holds every report read."""
+    client = anthropic.AsyncAnthropic(api_key=api_key)
+    schema = build_json_schema(taxonomy) if taxonomy else None
+    system_prompt = build_system_prompt()
+    semaphore = asyncio.Semaphore(TARGETED_GROUP_SIZE)
+
+    skip = set(skip_rowids)
+    queue = [r for r in ranked if r["rowid"] not in skip]
+    hits, hit_records, all_results, read_rowids = [], [], [], []
+    pos = 0
+    while True:
+        if len(hits) >= n_hits:
+            stop_reason = STOP_FOUND_ALL
+            break
+        if len(all_results) >= max_reports:
+            stop_reason = STOP_MAX_REPORTS
+            break
+        if pos >= len(queue):
+            stop_reason = STOP_NO_MORE
+            break
+        group = queue[pos:pos + min(TARGETED_GROUP_SIZE, max_reports - len(all_results))]
+        pos += len(group)
+        rowids = [r["rowid"] for r in group]
+        read_rowids += rowids
+        records_by_id = await asyncio.to_thread(get_records, rowids)
+        records = [records_by_id[rid] for rid in rowids if rid in records_by_id]
+        if not records:
+            continue
+        results = await _classify_many(
+            client, records, model, task, rules, taxonomy, thinking_effort,
+            system_prompt, schema, semaphore,
+        )
+        for record, res in zip(records, results):
+            all_results.append(res)
+            if is_hit(res, hit_field, hit_values):
+                hits.append(res)
+                hit_records.append(record)
+
+    trial_id = f"trial_{uuid4().hex[:12]}"
+    trial_store[trial_id] = {
+        "samples": list(hits),
+        "model": model,
+        "task": task,
+        "rules": rules,
+        "taxonomy": taxonomy,
+        "thinking_effort": thinking_effort,
+        "raw_samples": hit_records,
+        "mode": "Targeted",
+        "read_rowids": list(skip_rowids) + read_rowids,
+    }
+
+    # Misses are used only for token counts, so drop their text to keep the session small.
+    hit_ids = {id(h) for h in hits}
+    slim = [
+        r if id(r) in hit_ids else {**r, "source_text": "", "thinking_text": "", "raw_response": None}
+        for r in all_results
+    ]
+    return {
+        "trial_id": trial_id,
+        "samples": list(hits),
+        "total_cost_usd": _total_cost(all_results, model),
+        "success_count": len(hits),
+        "error_count": sum(1 for r in all_results if r["status"] == "error"),
+        "all_results": slim,
+        "reports_read": len(all_results),
+        "hits_found": len(hits),
+        "stop_reason": stop_reason,
     }
 
 

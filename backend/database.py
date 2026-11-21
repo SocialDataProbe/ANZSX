@@ -84,11 +84,17 @@ def get_filter_options() -> dict:
         sections = [r[0] for r in conn.execute(
             "SELECT DISTINCT section_name FROM fts_reports ORDER BY section_name"
         )]
+        # One (company, year, country) row per company-year. The Filter tab narrows
+        # the company list by year and country from this, without a new query.
+        company_index = [(r[0], r[1], r[2]) for r in conn.execute(
+            "SELECT DISTINCT company_name, year, country FROM fts_reports ORDER BY company_name"
+        )]
         total = conn.execute("SELECT COUNT(*) FROM fts_reports").fetchone()[0]
         return {
             "years": years,
             "countries": countries,
             "sections": sections,
+            "company_index": company_index,
             "section_descriptions": SECTION_DESCRIPTIONS,
             "total_records": total,
         }
@@ -96,23 +102,58 @@ def get_filter_options() -> dict:
         conn.close()
 
 
-def _build_primary_where(
-    years: list[str],
-    countries: list[str],
+def _scope_where(
+    years: list,
+    countries: list,
+    companies: list | None,
     section_name: str,
+    alias: str = "",
 ) -> tuple[str, list]:
-    placeholders_y = ",".join("?" * len(years))
-    placeholders_c = ",".join("?" * len(countries))
+    """WHERE conditions (without "WHERE") for one section. No companies = all companies."""
+    p = f"{alias}." if alias else ""
+    parts = [
+        f"{p}year IN ({','.join('?' * len(years))})",
+        f"{p}country IN ({','.join('?' * len(countries))})",
+    ]
+    params = list(years) + list(countries)
+    if companies:
+        parts.append(f"{p}company_name IN ({','.join('?' * len(companies))})")
+        params += list(companies)
+    parts += [f"{p}section_name = ?", f"length({p}content) > 0"]
+    params.append(section_name)
+    return " AND ".join(parts), params
 
+
+def _build_primary_where(
+    years: list,
+    countries: list,
+    section_name: str,
+    companies: list | None = None,
+) -> tuple[str, list]:
+    where, params = _scope_where(years, countries, companies, section_name)
+    return f"SELECT {{cols}} FROM fts_reports WHERE {where}", params
+
+
+# The single copy of the fallback filter, used by every function below.
+def _build_fallback_where(
+    years: list,
+    countries: list,
+    section_name: str,
+    fallback_section: str,
+    companies: list | None = None,
+) -> tuple[str, list]:
+    """Rows of the fallback section for companies that have no non-empty primary section."""
+    outer, outer_params = _scope_where(years, countries, companies, fallback_section, alias="f")
+    inner, inner_params = _scope_where(years, countries, companies, section_name)
     sql = (
-        f"SELECT {{cols}} FROM fts_reports "
-        f"WHERE year IN ({placeholders_y}) "
-        f"AND country IN ({placeholders_c}) "
-        f"AND section_name = ? "
-        f"AND length(content) > 0"
+        f"SELECT {{cols}} FROM fts_reports f WHERE {outer} "
+        f"AND f.company_name NOT IN (SELECT company_name FROM fts_reports WHERE {inner})"
     )
-    params = years + countries + [section_name]
-    return sql, params
+    return sql, outer_params + inner_params
+
+
+def _use_fallback(section_name: str, fallback_section: str | None) -> bool:
+    return bool(fallback_section) and fallback_section != section_name
 
 
 def get_filtered_count(
@@ -120,38 +161,19 @@ def get_filtered_count(
     countries: list[str],
     section_name: str,
     fallback_section: str | None = None,
+    companies: list[str] | None = None,
 ) -> dict:
     conn = _get_connection()
     try:
-        sql_tpl, params = _build_primary_where(
-            years, countries, section_name
-        )
-        count_sql = sql_tpl.format(cols="COUNT(*)")
-        primary_count = conn.execute(count_sql, params).fetchone()[0]
+        sql_tpl, params = _build_primary_where(years, countries, section_name, companies)
+        primary_count = conn.execute(sql_tpl.format(cols="COUNT(*)"), params).fetchone()[0]
 
         fallback_count = 0
-        if fallback_section and fallback_section != section_name:
-            placeholders_y = ",".join("?" * len(years))
-            placeholders_c = ",".join("?" * len(countries))
-            fb_sql = (
-                f"SELECT COUNT(*) FROM fts_reports f "
-                f"WHERE f.year IN ({placeholders_y}) "
-                f"AND f.country IN ({placeholders_c}) "
-                f"AND f.section_name = ? "
-                f"AND length(f.content) > 0 "
-                f"AND f.company_name NOT IN ("
-                f"  SELECT company_name FROM fts_reports "
-                f"  WHERE year IN ({placeholders_y}) "
-                f"  AND country IN ({placeholders_c}) "
-                f"  AND section_name = ? "
-                f"  AND length(content) > 0"
-                f")"
+        if _use_fallback(section_name, fallback_section):
+            fb_tpl, fb_params = _build_fallback_where(
+                years, countries, section_name, fallback_section, companies
             )
-            fb_params = (
-                years + countries + [fallback_section]
-                + years + countries + [section_name]
-            )
-            fallback_count = conn.execute(fb_sql, fb_params).fetchone()[0]
+            fallback_count = conn.execute(fb_tpl.format(cols="COUNT(*)"), fb_params).fetchone()[0]
 
         return {
             "count": primary_count + fallback_count,
@@ -169,40 +191,20 @@ def get_filtered_records(
     fallback_section: str | None = None,
     limit: int = 100,
     offset: int = 0,
+    companies: list[str] | None = None,
 ) -> dict:
     conn = _get_connection()
     try:
-        sql_tpl, params = _build_primary_where(
-            years, countries, section_name
-        )
-        select_sql = sql_tpl.format(
-            cols="rowid, company_name, year, section_name, country, length(content) as content_length"
-        )
+        cols = "rowid, company_name, year, section_name, country, length(content) as content_length"
+        sql_tpl, params = _build_primary_where(years, countries, section_name, companies)
+        select_sql = sql_tpl.format(cols=cols)
 
-        if fallback_section and fallback_section != section_name:
-            placeholders_y = ",".join("?" * len(years))
-            placeholders_c = ",".join("?" * len(countries))
-            fb_sql = (
-                f"SELECT rowid, company_name, year, section_name, country, "
-                f"length(content) as content_length FROM fts_reports f "
-                f"WHERE f.year IN ({placeholders_y}) "
-                f"AND f.country IN ({placeholders_c}) "
-                f"AND f.section_name = ? "
-                f"AND length(f.content) > 0 "
-                f"AND f.company_name NOT IN ("
-                f"  SELECT company_name FROM fts_reports "
-                f"  WHERE year IN ({placeholders_y}) "
-                f"  AND country IN ({placeholders_c}) "
-                f"  AND section_name = ? "
-                f"  AND length(content) > 0"
-                f")"
-            )
-            fb_params = (
-                years + countries + [fallback_section]
-                + years + countries + [section_name]
+        if _use_fallback(section_name, fallback_section):
+            fb_tpl, fb_params = _build_fallback_where(
+                years, countries, section_name, fallback_section, companies
             )
             combined = (
-                f"SELECT * FROM ({select_sql} UNION ALL {fb_sql}) "
+                f"SELECT * FROM ({select_sql} UNION ALL {fb_tpl.format(cols=cols)}) "
                 f"ORDER BY company_name, year "
                 f"LIMIT ? OFFSET ?"
             )
@@ -215,7 +217,7 @@ def get_filtered_records(
         records = [dict(r) for r in rows]
 
         count_info = get_filtered_count(
-            years, countries, section_name, fallback_section,
+            years, countries, section_name, fallback_section, companies,
         )
         return {
             "records": records,
@@ -231,40 +233,20 @@ def get_filtered_rowids(
     countries: list[str],
     section_name: str,
     fallback_section: str | None = None,
+    companies: list[str] | None = None,
 ) -> list[dict]:
     conn = _get_connection()
     try:
-        sql_tpl, params = _build_primary_where(
-            years, countries, section_name
-        )
-        select_sql = sql_tpl.format(
-            cols="rowid, company_name, year, section_name, country"
-        )
+        cols = "rowid, company_name, year, section_name, country"
+        sql_tpl, params = _build_primary_where(years, countries, section_name, companies)
+        select_sql = sql_tpl.format(cols=cols)
 
-        if fallback_section and fallback_section != section_name:
-            placeholders_y = ",".join("?" * len(years))
-            placeholders_c = ",".join("?" * len(countries))
-            fb_sql = (
-                f"SELECT rowid, company_name, year, section_name, country "
-                f"FROM fts_reports f "
-                f"WHERE f.year IN ({placeholders_y}) "
-                f"AND f.country IN ({placeholders_c}) "
-                f"AND f.section_name = ? "
-                f"AND length(f.content) > 0 "
-                f"AND f.company_name NOT IN ("
-                f"  SELECT company_name FROM fts_reports "
-                f"  WHERE year IN ({placeholders_y}) "
-                f"  AND country IN ({placeholders_c}) "
-                f"  AND section_name = ? "
-                f"  AND length(content) > 0"
-                f")"
-            )
-            fb_params = (
-                years + countries + [fallback_section]
-                + years + countries + [section_name]
+        if _use_fallback(section_name, fallback_section):
+            fb_tpl, fb_params = _build_fallback_where(
+                years, countries, section_name, fallback_section, companies
             )
             combined = (
-                f"SELECT * FROM ({select_sql} UNION ALL {fb_sql}) "
+                f"SELECT * FROM ({select_sql} UNION ALL {fb_tpl.format(cols=cols)}) "
                 f"ORDER BY company_name, year"
             )
             all_params = params + fb_params
@@ -296,6 +278,46 @@ def get_records_by_rowids(rowids: list[int], chunk_size: int = 50) -> dict[int, 
         conn.close()
 
 
+def build_fts_query(terms: list[str]) -> str:
+    """An FTS5 query that matches any of the terms. Each term is quoted, so punctuation
+    (for example the hyphen in "share-based") cannot cause a syntax error."""
+    seen = set()
+    quoted = []
+    for term in terms:
+        t = " ".join(str(term).split())
+        if not t or t.lower() in seen:
+            continue
+        seen.add(t.lower())
+        quoted.append('"' + t.replace('"', '""') + '"')
+    return " OR ".join(quoted)
+
+
+def search_ranked(
+    fts_query: str,
+    years: list[str],
+    countries: list[str],
+    section_name: str,
+    limit: int,
+    companies: list[str] | None = None,
+) -> list[dict]:
+    """Rows of the primary section that match the query, best BM25 match first.
+    Returns metadata only, not content. The fallback section is not searched."""
+    if not fts_query:
+        return []
+    conn = _get_connection()
+    try:
+        where, params = _scope_where(years, countries, companies, section_name)
+        rows = conn.execute(
+            "SELECT rowid, company_name, year, section_name, country FROM fts_reports "
+            f"WHERE fts_reports MATCH ? AND {where} "
+            "ORDER BY bm25(fts_reports) LIMIT ?",
+            [fts_query] + params + [int(limit)],
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def get_record_content(rowid: int) -> dict:
     conn = _get_connection()
     try:
@@ -320,40 +342,20 @@ def get_sample_records(
     section_name: str,
     fallback_section: str | None = None,
     n: int = 15,
+    companies: list[str] | None = None,
 ) -> dict:
     conn = _get_connection()
     try:
-        sql_tpl, params = _build_primary_where(
-            years, countries, section_name
-        )
-        select_sql = sql_tpl.format(
-            cols="rowid, company_name, year, section_name, country, content, length(content) as content_length"
-        )
+        cols = "rowid, company_name, year, section_name, country, content, length(content) as content_length"
+        sql_tpl, params = _build_primary_where(years, countries, section_name, companies)
+        select_sql = sql_tpl.format(cols=cols)
 
-        if fallback_section and fallback_section != section_name:
-            placeholders_y = ",".join("?" * len(years))
-            placeholders_c = ",".join("?" * len(countries))
-            fb_sql = (
-                f"SELECT rowid, company_name, year, section_name, country, content, "
-                f"length(content) as content_length FROM fts_reports f "
-                f"WHERE f.year IN ({placeholders_y}) "
-                f"AND f.country IN ({placeholders_c}) "
-                f"AND f.section_name = ? "
-                f"AND length(f.content) > 0 "
-                f"AND f.company_name NOT IN ("
-                f"  SELECT company_name FROM fts_reports "
-                f"  WHERE year IN ({placeholders_y}) "
-                f"  AND country IN ({placeholders_c}) "
-                f"  AND section_name = ? "
-                f"  AND length(content) > 0"
-                f")"
-            )
-            fb_params = (
-                years + countries + [fallback_section]
-                + years + countries + [section_name]
+        if _use_fallback(section_name, fallback_section):
+            fb_tpl, fb_params = _build_fallback_where(
+                years, countries, section_name, fallback_section, companies
             )
             combined = (
-                f"SELECT * FROM ({select_sql} UNION ALL {fb_sql}) "
+                f"SELECT * FROM ({select_sql} UNION ALL {fb_tpl.format(cols=cols)}) "
                 f"ORDER BY RANDOM() LIMIT ?"
             )
             all_params = params + fb_params + [n]
@@ -377,12 +379,11 @@ def get_content_stats(
     countries: list[str],
     section_name: str,
     fallback_section: str | None = None,
+    companies: list[str] | None = None,
 ) -> dict:
     conn = _get_connection()
     try:
-        sql_tpl, params = _build_primary_where(
-            years, countries, section_name
-        )
+        sql_tpl, params = _build_primary_where(years, countries, section_name, companies)
         stats_sql = sql_tpl.format(
             cols="COUNT(*) as cnt, AVG(length(content)) as avg_len, "
             "SUM(length(content)) as total_len, "
@@ -391,30 +392,15 @@ def get_content_stats(
         row = conn.execute(stats_sql, params).fetchone()
         result = dict(row)
 
-        if fallback_section and fallback_section != section_name:
-            placeholders_y = ",".join("?" * len(years))
-            placeholders_c = ",".join("?" * len(countries))
-            fb_sql = (
-                f"SELECT COUNT(*) as cnt, AVG(length(content)) as avg_len, "
-                f"SUM(length(content)) as total_len FROM fts_reports f "
-                f"WHERE f.year IN ({placeholders_y}) "
-                f"AND f.country IN ({placeholders_c}) "
-                f"AND f.section_name = ? "
-                f"AND length(f.content) > 0 "
-                f"AND f.company_name NOT IN ("
-                f"  SELECT company_name FROM fts_reports "
-                f"  WHERE year IN ({placeholders_y}) "
-                f"  AND country IN ({placeholders_c}) "
-                f"  AND section_name = ? "
-                f"  AND length(content) > 0"
-                f")"
+        if _use_fallback(section_name, fallback_section):
+            fb_tpl, fb_params = _build_fallback_where(
+                years, countries, section_name, fallback_section, companies
             )
-            fb_params = (
-                years + countries + [fallback_section]
-                + years + countries + [section_name]
+            fb_sql = fb_tpl.format(
+                cols="COUNT(*) as cnt, AVG(length(content)) as avg_len, "
+                "SUM(length(content)) as total_len"
             )
-            fb_row = conn.execute(fb_sql, fb_params).fetchone()
-            fb = dict(fb_row)
+            fb = dict(conn.execute(fb_sql, fb_params).fetchone())
             total_cnt = (result["cnt"] or 0) + (fb["cnt"] or 0)
             total_len = (result["total_len"] or 0) + (fb["total_len"] or 0)
             result["cnt"] = total_cnt

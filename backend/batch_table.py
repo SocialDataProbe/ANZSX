@@ -56,6 +56,7 @@ class RunConfig:
             filters={
                 "years": list(cp.get("years") or []),
                 "countries": list(cp.get("countries") or []),
+                "companies": list(cp.get("companies") or []),
                 "section_name": cp.get("section_name", ""),
                 "fallback_section": cp.get("fallback_section") or "",
             },

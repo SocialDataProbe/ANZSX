@@ -1,5 +1,7 @@
 import asyncio
 import concurrent.futures
+import json
+import re
 import traceback
 
 import streamlit as st
@@ -8,7 +10,6 @@ from backend import batch_processor, classifier, database
 from backend.batch_table import BatchTable, RunConfig
 from backend.cost import estimate_cost, estimate_full_run, match_pricing, suggested_concurrency, USD_TO_AUD
 from backend.rate_limiter import start_tier_limits
-from backend.templates import build_user_message
 from backend.verification import compute_dn_confidence, validate_jev_api_key, verify_trial_results
 
 st.set_page_config(
@@ -199,6 +200,7 @@ DEFAULTS = {
     "config": None,
     "selected_years": [],
     "selected_countries": [],
+    "selected_companies": [],
     "selected_section": "",
     "fallback_section": "",
     "filtered_count": None,
@@ -211,6 +213,13 @@ DEFAULTS = {
     "trial_confirmed": False,
     "saved_prompt": None,
     "trial_store": {},
+    # Sample Run (tab 4). Targeted mode: find hits with a keyword (BM25) search.
+    "sample_mode": "Random",
+    "hit_field": "",
+    "hit_values": [],
+    "hits_to_find": 15,
+    "max_reports": 50,
+    "targeted_search": None,  # hidden: search key, FTS query and rowids already read
     "jev_api_key": "",
     "jev_api_key_valid": False,
     "api_key_input_n": 0,
@@ -231,17 +240,23 @@ for key, default in DEFAULTS.items():
 # Shared by all sessions: on Turso this takes about 30 s.
 @st.cache_data(show_spinner="Loading the database...")
 def _cached_filter_options():
+    # Includes "company_index" (company, year, country) for the Companies filter.
     return database.get_filter_options()
 
 
-if st.session_state.config is None:
-    try:
-        cfg = _cached_filter_options()
-        st.session_state.config = cfg
-    except Exception:
-        # Visitors only see the message below. The details go to the server log
-        # (the terminal locally, "Manage app" on Streamlit Cloud).
-        traceback.print_exc()
+# The load adds a spinner element, but only on the first run. The container is drawn on
+# every run, so the tabs below stay at the same place. If the tabs moved, Streamlit
+# would make new tabs and the user would go back to the first tab (Description).
+with st.container():
+    # An older session config has no company list, so load it again.
+    if st.session_state.config is None or "company_index" not in st.session_state.config:
+        try:
+            cfg = _cached_filter_options()
+            st.session_state.config = cfg
+        except Exception:
+            # Visitors only see the message below. The details go to the server log
+            # (the terminal locally, "Manage app" on Streamlit Cloud).
+            traceback.print_exc()
 
 st.markdown(
     '<div class="uom-banner">'
@@ -266,9 +281,18 @@ def _filter_params() -> dict:
     return {
         "years": st.session_state.selected_years,
         "countries": st.session_state.selected_countries,
+        "companies": st.session_state.selected_companies,
         "section_name": st.session_state.selected_section,
         "fallback_section": st.session_state.fallback_section,
     }
+
+
+def _companies_text(companies) -> str:
+    if not companies:
+        return "All"
+    if len(companies) > 5:
+        return f"{len(companies):,} companies"
+    return ", ".join(companies)
 
 
 def _get_rules() -> list[str]:
@@ -373,6 +397,33 @@ def _delete_category(tax_idx: int, cat_idx: int):
         st.session_state[f"tax_{tax_idx}_show_cats"] = False
 
 
+def _current_prompt() -> dict:
+    # Same shape as st.session_state.saved_prompt, so the two can be compared.
+    return {
+        "task": st.session_state.task_prompt,
+        "rules": _get_rules(),
+        "taxonomy": _get_taxonomy(),
+    }
+
+
+# A template blank, e.g. "[the item]". Templates mark each part the user must replace.
+_BLANK_RE = re.compile(r"\[[^\[\]\n]+\]")
+
+
+def _find_blanks(prompt: dict) -> list[str]:
+    texts = [prompt["task"], *prompt["rules"]]
+    for entry in prompt["taxonomy"]:
+        texts.append(entry["definition"])
+        for cat in entry.get("categories", []):
+            texts += [cat["name"], cat["description"]]
+    found = []
+    for text in texts:
+        for blank in _BLANK_RE.findall(text):
+            if blank not in found:
+                found.append(blank)
+    return found
+
+
 def _classify_params() -> dict:
     return {
         **_filter_params(),
@@ -393,36 +444,56 @@ is_ready = (
 )
 
 
-@st.dialog("Confirm Trial Run", width="large")
+TARGETED_COST_WARNING = (
+    "A larger maximum reads more reports and costs more. "
+    "The keyword search reads the most likely reports first."
+)
+TARGETED_SCOPE_WARNING = (
+    "This is a top-N search. It does not read all the reports, so do not use these "
+    "results to make conclusions about the full dataset."
+)
+
+
+def _hit_text() -> str:
+    """The hit definition in words, for the confirm dialog."""
+    field = st.session_state.hit_field
+    values = st.session_state.hit_values
+    entry = next((e for e in _get_taxonomy() if e["code"] == field), None)
+    if entry and entry.get("categories"):
+        return f"`{field}` is {' or '.join(values) if values else '—'}"
+    return f"`{field}` has an answer (not \"Don't Know\")"
+
+
+@st.dialog("Confirm Sample Run", width="large")
 def _confirm_trial_dialog():
     fp = _filter_params()
     cp = _classify_params()
+    targeted = st.session_state.sample_mode == "Targeted"
 
-    st.markdown("**Are you sure you want to run the trial?**")
+    st.markdown("**Are you sure you want to run the sample?**")
     st.markdown("The following configuration will be used:")
 
     c1, c2 = st.columns(2)
     c1.markdown(f"**Years:** {', '.join(str(y) for y in fp['years'])}")
     c2.markdown(f"**Countries:** {', '.join(fp['countries'])}")
     c1.markdown(f"**Primary Section:** {fp['section_name']}")
-    c2.markdown(f"**Fallback Section:** {fp.get('fallback_section') or '—'}")
+    if targeted:
+        c2.markdown("**Fallback Section:** not used in Targeted mode")
+    else:
+        c2.markdown(f"**Fallback Section:** {fp.get('fallback_section') or '—'}")
+    c1.markdown(f"**Companies:** {_companies_text(fp.get('companies'))}")
+    c2.markdown(f"**Sample type:** {st.session_state.sample_mode}")
+    if targeted:
+        st.markdown(
+            f"**Hit:** {_hit_text()}  \n"
+            f"**Hits to find:** {st.session_state.hits_to_find} · "
+            f"**Maximum reports to read:** {st.session_state.max_reports}"
+        )
+        st.caption(TARGETED_COST_WARNING)
 
     st.divider()
-    st.markdown("**User Message Template**")
-    preview = build_user_message(
-        company="{company}",
-        year="{year}",
-        section=fp["section_name"],
-        content="{document content}",
-        task=cp["task"],
-        rules=cp["rules"],
-        taxonomy=cp["taxonomy"],
-        section_description=database.SECTION_DESCRIPTIONS.get(fp["section_name"]),
-    )
-    st.code(preview, language=None)
-
     col_yes, col_no = st.columns(2)
-    if col_yes.button("Yes, run trial", type="primary", use_container_width=True):
+    if col_yes.button("Yes, run sample", type="primary", use_container_width=True):
         st.session_state.trial_confirmed = True
         st.rerun()
     if col_no.button("Cancel", use_container_width=True):
@@ -453,6 +524,129 @@ def _run_jev_if_enabled(result: dict, raw_samples: list[dict], cp: dict):
             result["samples"][i]["confidence"] = v
 
 
+def _set_cost_estimate(samples: list[dict], cp: dict):
+    """The tab 5 estimate: average tokens of the successful samples x the filtered count."""
+    successful = [s for s in samples if s["status"] == "success"]
+    if not successful:
+        return
+    avg_in = sum(s["input_tokens"] for s in successful) / len(successful)
+    avg_out = sum(s["output_tokens"] for s in successful) / len(successful)
+    record_count = st.session_state.filtered_count["count"]
+    model_used = successful[0].get("model_used", cp["model"])
+    prices = match_pricing(model_used)
+    total_in = avg_in * record_count
+    total_out = avg_out * record_count
+    cost_usd = total_in / 1_000_000 * prices["input"] + total_out / 1_000_000 * prices["output"]
+    st.session_state.cost_estimate = {
+        "record_count": record_count,
+        "avg_input_tokens": int(avg_in),
+        "avg_output_tokens": int(avg_out),
+        "total_input_tokens": int(total_in),
+        "total_output_tokens": int(total_out),
+        "model": model_used,
+        "model_label": prices["label"],
+        "input_rate": prices["input"],
+        "output_rate": prices["output"],
+        "estimated_cost_usd": round(cost_usd, 2),
+        "trial_sample_count": len(successful),
+    }
+
+
+def _classify_samples(samples: list[dict], cp: dict, spinner: str) -> dict | None:
+    """Classify the given samples, run Jev, and update the cost estimate."""
+    with st.spinner(spinner):
+        result = _run_async(classifier.run_trial(
+            samples, cp["model"], cp["task"], cp["rules"],
+            taxonomy=cp["taxonomy"],
+            thinking_effort=cp["thinking_effort"],
+            api_key=st.session_state.api_key,
+            trial_store=st.session_state.trial_store,
+        ))
+    result = _check(result)
+    if result:
+        _run_jev_if_enabled(result, samples, cp)
+        _set_cost_estimate(result["samples"], cp)
+    return result
+
+
+def _random_sample(fp: dict, cp: dict, spinner: str) -> dict | None:
+    sample_result = database.get_sample_records(
+        fp["years"], fp["countries"], fp["section_name"], fp.get("fallback_section"), n=15,
+        companies=fp.get("companies"),
+    )
+    samples = sample_result["samples"]
+    if not samples:
+        st.error("No records match the current filters.")
+        return None
+    return _classify_samples(samples, cp, spinner)
+
+
+def _search_key(fp: dict, cp: dict, field: str, values: list[str]) -> str:
+    """Two Targeted runs with the same key use the same ranked list."""
+    return json.dumps(
+        [fp["years"], fp["countries"], fp.get("companies") or [], fp["section_name"],
+         cp["task"], field, sorted(values)],
+        default=str,
+    )
+
+
+def _targeted_sample(fp: dict, cp: dict, continue_search: bool) -> dict | None:
+    """Find hits with the keyword search. continue_search=True (New Sample) skips the
+    reports that the last search with the same settings already read."""
+    field = next((e for e in cp["taxonomy"] if e["code"] == st.session_state.hit_field), None)
+    if field is None:
+        st.error("Select a hit field.")
+        return None
+    values = list(st.session_state.hit_values) if field.get("categories") else []
+    if field.get("categories") and not values:
+        st.error("Select at least one hit value.")
+        return None
+    n_hits = int(st.session_state.hits_to_find)
+    max_reports = int(st.session_state.max_reports)
+    key = _search_key(fp, cp, field["code"], values)
+    prev = st.session_state.targeted_search
+
+    with st.spinner("Searching for hits... This can take a few minutes."):
+        if continue_search and prev and prev["key"] == key:
+            fts_query, skip = prev["fts_query"], list(prev["read_rowids"])
+        else:
+            terms = _run_async(classifier.make_search_terms(
+                cp["task"], field, values, api_key=st.session_state.api_key,
+            ))
+            fts_query, skip = database.build_fts_query(terms), []
+        try:
+            ranked = database.search_ranked(
+                fts_query, fp["years"], fp["countries"], fp["section_name"],
+                limit=len(skip) + max_reports, companies=fp.get("companies"),
+            )
+        except Exception:
+            traceback.print_exc()
+            st.error("The keyword search failed. Please try again.")
+            return None
+        result = _run_async(classifier.run_targeted(
+            ranked, field["code"], values, n_hits, max_reports,
+            cp["model"], cp["task"], cp["rules"],
+            taxonomy=cp["taxonomy"],
+            thinking_effort=cp["thinking_effort"],
+            api_key=st.session_state.api_key,
+            trial_store=st.session_state.trial_store,
+            get_records=database.get_records_by_rowids,
+            skip_rowids=skip,
+        ))
+
+    trial = st.session_state.trial_store[result["trial_id"]]
+    st.session_state.targeted_search = {
+        "key": key,
+        "fts_query": fts_query,
+        "read_rowids": trial["read_rowids"],
+    }
+    result["mode"] = "Targeted"
+    _run_jev_if_enabled(result, trial["raw_samples"], cp)
+    # Every report read costs money, so the estimate uses hits and misses.
+    _set_cost_estimate(result["all_results"], cp)
+    return result
+
+
 # ── Tabs ───────────────────────────────────────────────────────────
 
 tab_bg, tab_setup, tab_filter, tab_prompt, tab_trial, tab_cost, tab_full = st.tabs([
@@ -460,7 +654,7 @@ tab_bg, tab_setup, tab_filter, tab_prompt, tab_trial, tab_cost, tab_full = st.ta
     "(1) Setup",
     "(2) Filter Records",
     "(3) Extraction Prompt",
-    "(4) Trial Run",
+    "(4) Sample Run",
     "(5) Cost Estimate",
     "(6) Full Run",
 ])
@@ -485,11 +679,12 @@ with tab_bg:
     st.subheader("How it works")
     st.markdown(
         "1. **Setup** — Enter your Claude API key and choose a model.\n"
-        "2. **Filter** — Select which years, countries, and report sections to process.\n"
-        "3. **Prompt** — Write an extraction prompt describing what data to pull from each report "
-        "(e.g. classify industry, extract revenue figures, identify risk factors).\n"
+        "2. **Filter** — Select which years, countries, companies, and report sections to process.\n"
+        "3. **Prompt** — Choose what you want from each report (extract data, classify, "
+        "summarise or custom). Load an example or a template, then change it for your research.\n"
         "4. **Cost Estimate** — See the estimated token usage and cost before committing.\n"
-        "5. **Trial Run** — Test your prompt on 15 random samples to check quality.\n"
+        "5. **Sample Run** — Test your prompt on 15 random reports, or use a keyword search "
+        "to find reports with a value you select (Targeted), to check quality.\n"
         "6. **Full Run** — Classify every filtered record, download the results as CSV, "
         "and resume unfinished runs by uploading the CSV again."
     )
@@ -660,6 +855,27 @@ with tab_filter:
             c for c in st.session_state["country_ms"] if c != _COUNTRY_ALL
         ]
 
+    # The company list follows the Years and Countries above (no selection = any).
+    sel_years = set(st.session_state.selected_years)
+    sel_countries = set(st.session_state.selected_countries)
+    company_options = sorted({
+        name for name, year, country in config.get("company_index", [])
+        if (not sel_years or year in sel_years)
+        and (not sel_countries or country in sel_countries)
+    })
+    if "company_ms" not in st.session_state:
+        st.session_state["company_ms"] = list(st.session_state.selected_companies)
+    # Remove selected companies that the Years/Countries no longer include.
+    allowed = set(company_options)
+    st.session_state["company_ms"] = [c for c in st.session_state["company_ms"] if c in allowed]
+    st.multiselect(
+        "Companies", company_options, key="company_ms",
+        placeholder="All companies – type to search",
+        help="Type part of a name to search. Leave empty to include all companies.",
+    )
+    st.caption(f"{len(company_options):,} companies match the selected years and countries.")
+    st.session_state.selected_companies = list(st.session_state["company_ms"])
+
     with st.expander("Section descriptions"):
         for name, desc in database.SECTION_DESCRIPTIONS.items():
             st.markdown(f"**{name}** — {desc}")
@@ -697,6 +913,7 @@ with tab_filter:
             with st.spinner("Counting records..."):
                 result = database.get_filtered_count(
                     fp["years"], fp["countries"], fp["section_name"], fp.get("fallback_section"),
+                    companies=fp.get("companies"),
                 )
             if result:
                 st.session_state.filtered_count = result
@@ -713,9 +930,17 @@ with tab_filter:
 
 with tab_prompt:
     st.markdown(
-        "Build your extraction prompt by filling in the sections below. "
+        "Build your prompt by filling in the form below. "
         "The model automatically receives the document context (company, year, section) "
-        "along with your task and rules."
+        "together with your prompt.\n\n"
+        "The prompt has three parts:\n"
+        "- **Task**: the overall job for each report.\n"
+        "- **Output fields**: the answers you want. Each field becomes a column in your results file.\n"
+        "- **Rules** *(optional)*: limits that apply to all the answers."
+    )
+    st.info(
+        "Please click **Save Prompt** at the bottom of this tab to save your prompt. "
+        "The next tabs use the saved prompt only."
     )
 
     EXAMPLE_TASK_INDUSTRY = (
@@ -794,6 +1019,111 @@ with tab_prompt:
         },
     ]
 
+    EXAMPLE_TASK_OUTLOOK = (
+        "Summarise what the company says about its outlook and plans for the next "
+        "financial year. Use only the parts of the document that discuss the outlook, "
+        "future plans or strategy for the coming year."
+    )
+
+    EXAMPLE_RULES_OUTLOOK = [
+        "Write no more than 3 sentences.",
+        "Include only statements about the future. Do not summarise results for the current or earlier years.",
+        "Do not add opinions or facts that are not in the document.",
+    ]
+
+    EXAMPLE_TAXONOMY_OUTLOOK = [
+        {
+            "code": "outlook_summary",
+            "definition": "A summary of the company's stated outlook and plans for the next financial year, in no more than 3 sentences.",
+        },
+        {
+            "code": "outlook_tone",
+            "definition": "The overall tone of the company's statements about its outlook.",
+            "categories": [
+                {"name": "Positive", "description": "The company expects growth, better results or better conditions."},
+                {"name": "Neutral", "description": "The company expects results or conditions to stay about the same, or gives no clear direction."},
+                {"name": "Negative", "description": "The company expects lower results, worse conditions or major problems."},
+                {"name": "Mixed", "description": "The company expects both clearly good and clearly bad results or conditions, and neither is the main message."},
+            ],
+        },
+    ]
+
+    # Templates: each part in [square brackets] is a blank for the user to replace.
+    # Save warns while blanks remain (see _find_blanks).
+    TEMPLATE_TASK_EXTRACT = (
+        "Find [the item you want, e.g. the number of employees] in the document. "
+        "Give the value for the target year only."
+    )
+
+    TEMPLATE_RULES_EXTRACT = [
+        "Use only [where to look, e.g. the table titled ...].",
+        "If the value appears more than once, use [which one to use].",
+        "Copy the value exactly as it appears in the document. Do not calculate or convert it.",
+    ]
+
+    TEMPLATE_TAXONOMY_EXTRACT = [
+        {
+            "code": "value",
+            "definition": "[The item] for the target year, exactly as it appears in the document.",
+        },
+        {
+            "code": "unit",
+            "definition": "The unit of [the item], as shown in the document.",
+            "categories": [
+                {"name": "[Unit 1]", "description": "[What this unit means]"},
+                {"name": "[Unit 2]", "description": "[What this unit means]"},
+            ],
+        },
+        {
+            "code": "reported",
+            "definition": "Whether the document reports [the item].",
+            "categories": [
+                {"name": "Yes", "description": "The document reports [the item]."},
+                {"name": "No", "description": "The document does not report [the item]."},
+            ],
+        },
+    ]
+
+    TEMPLATE_TASK_CLASSIFY = (
+        "Classify the company by [what you want to classify, e.g. its main customer type], "
+        "based on [which part of the document]. Ignore all other content in the document."
+    )
+
+    TEMPLATE_RULES_CLASSIFY = [
+        "Classify by [the main basis for the decision], not by [what the model must ignore].",
+        "If more than one category fits, choose [how to choose, e.g. the category that best describes the main activity].",
+    ]
+
+    TEMPLATE_TAXONOMY_CLASSIFY = [
+        {
+            "code": "category",
+            "definition": "The [thing you classify] of the company, based on [which part of the document].",
+            "categories": [
+                {"name": "[Category A]", "description": "[When to use this category, and where it stops]"},
+                {"name": "[Category B]", "description": "[When to use this category, and where it stops]"},
+                {"name": "[Category C]", "description": "[When to use this category, and where it stops]"},
+            ],
+        },
+    ]
+
+    TEMPLATE_TASK_SUMMARY = (
+        "Summarise what the company says about [the topic, e.g. its main risks]. "
+        "Use only the company's own statements in the document."
+    )
+
+    TEMPLATE_RULES_SUMMARY = [
+        "Write no more than [number] sentences.",
+        "Use plain language. Do not copy long passages from the document.",
+        "Do not add opinions or facts that are not in the document.",
+    ]
+
+    TEMPLATE_TAXONOMY_SUMMARY = [
+        {
+            "code": "summary",
+            "definition": "A summary of what the company says about [the topic], in no more than [number] sentences.",
+        },
+    ]
+
     def _set_example(task, rules, taxonomy=None):
         st.session_state.task_prompt = task
         for i in range(st.session_state.get("rule_count", 0)):
@@ -819,36 +1149,190 @@ with tab_prompt:
                     st.session_state[f"tax_{i}_cat_count"] = 0
             st.session_state.taxonomy_count = len(taxonomy)
 
-    col_ex1, col_ex2, col_clear = st.columns([2, 2, 1])
-    with col_ex1:
-        if st.button("Example: Industry Classification"):
-            _set_example(EXAMPLE_TASK_INDUSTRY, EXAMPLE_RULES_INDUSTRY, EXAMPLE_TAXONOMY_INDUSTRY)
-            st.rerun()
-        st.caption("Section: Business Review")
-    with col_ex2:
-        if st.button("Example: Revenue Extraction"):
-            _set_example(EXAMPLE_TASK_REVENUE, EXAMPLE_RULES_REVENUE, EXAMPLE_TAXONOMY_REVENUE)
-            st.rerun()
-        st.caption("Section: Financial Statements")
-    with col_clear:
-        if st.button("Clear All"):
+    # The cards only fill in the form below (as _set_example always did).
+    # They do not change what the app sends to the model.
+    PROMPT_TYPES = [
+        {
+            "key": "extract",
+            "title": "Extract data",
+            "text": "Find a value, e.g. revenue.",
+            "example": ("Revenue", "Financial Statements",
+                        (EXAMPLE_TASK_REVENUE, EXAMPLE_RULES_REVENUE, EXAMPLE_TAXONOMY_REVENUE)),
+            "template": (TEMPLATE_TASK_EXTRACT, TEMPLATE_RULES_EXTRACT, TEMPLATE_TAXONOMY_EXTRACT),
+        },
+        {
+            "key": "classify",
+            "title": "Classify",
+            "text": "Put each company in one group from a list, e.g. industry.",
+            "example": ("Industry", "Business Review",
+                        (EXAMPLE_TASK_INDUSTRY, EXAMPLE_RULES_INDUSTRY, EXAMPLE_TAXONOMY_INDUSTRY)),
+            "template": (TEMPLATE_TASK_CLASSIFY, TEMPLATE_RULES_CLASSIFY, TEMPLATE_TAXONOMY_CLASSIFY),
+        },
+        {
+            "key": "summary",
+            "title": "Summarise",
+            "text": "Write a short text, e.g. the company's outlook.",
+            "example": ("Outlook", "Business Review",
+                        (EXAMPLE_TASK_OUTLOOK, EXAMPLE_RULES_OUTLOOK, EXAMPLE_TAXONOMY_OUTLOOK)),
+            "template": (TEMPLATE_TASK_SUMMARY, TEMPLATE_RULES_SUMMARY, TEMPLATE_TAXONOMY_SUMMARY),
+        },
+    ]
+
+    st.markdown("**What do you want to get from each report?**")
+    type_cols = st.columns(4)
+    for col, ptype in zip(type_cols, PROMPT_TYPES):
+        with col, st.container(border=True):
+            st.markdown(f"**{ptype['title']}**")
+            st.caption(ptype["text"])
+            ex_name, ex_section, ex_args = ptype["example"]
+            if st.button(f"Example: {ex_name}", key=f"example_{ptype['key']}", use_container_width=True):
+                _set_example(*ex_args)
+                st.rerun()
+            st.caption(f"Example section: {ex_section}")
+            if st.button("Use template", key=f"template_{ptype['key']}", use_container_width=True):
+                _set_example(*ptype["template"])
+                st.rerun()
+    with type_cols[3], st.container(border=True):
+        st.markdown("**Custom (blank form)**")
+        st.caption("Start with an empty form and build your own prompt.")
+        if st.button("Start blank", key="template_custom", use_container_width=True):
             _set_example("", [])
             st.rerun()
+    st.caption(
+        "All four use the same form below. The choice only fills in the form for you. "
+        "You can change anything. In a template, replace each part in [square brackets] "
+        "with your own text."
+    )
 
     st.session_state.task_prompt = st.text_area(
         "Task ✱",
         value=st.session_state.task_prompt,
         height=150,
         help=(
-            "Describe what data to extract or how to classify each report section. "
-            "Specify the exact JSON output format you expect. "
-            "This instruction is sent to the model for every record."
+            "Describe the overall job for each report, e.g. what to find and where to look "
+            "in the document. You do not need to describe the output format: the app makes "
+            "it from your output fields. The model gets this task for every record."
         ),
         placeholder="e.g. Classify this company's primary industry based on the report content...",
     )
 
     if not st.session_state.task_prompt.strip():
-        st.warning("A task is required before you can run a trial.")
+        st.warning("A task is required before you can run a sample.")
+
+    st.divider()
+
+    # ── Output fields section (mandatory). Called "taxonomy" in the code. ──
+    st.markdown("**Output fields** ✱ — the answers you want from each report")
+    st.caption(
+        "Each field becomes a column in your results file. "
+        "**Column name** is the name of the column (e.g. `revenue`). "
+        "**What to find** tells the model what to give for this field. "
+        "You can add **Allowed answers** to make the model choose one answer from a fixed list."
+    )
+
+    for i in range(st.session_state.get("taxonomy_count", 0)):
+        col_code, col_del = st.columns([6, 1])
+        with col_code:
+            st.text_input(
+                f"Column name {i + 1}",
+                key=f"tax_{i}_code",
+                label_visibility="collapsed",
+                placeholder="Column name (e.g. total_revenue)",
+            )
+        with col_del:
+            if st.button(":material/close:", key=f"del_tax_{i}", help="Remove this field"):
+                _delete_taxonomy_entry(i)
+                st.rerun()
+
+        code_val = st.session_state.get(f"tax_{i}_code", "")
+        if code_val and not _is_valid_code(code_val):
+            st.error("The column name must start with a letter and contain only letters, numbers and underscores.")
+
+        st.text_input(
+            f"What to find {i + 1}",
+            key=f"tax_{i}_definition",
+            label_visibility="collapsed",
+            placeholder="What to find: what must the model give for this field?",
+        )
+
+        if not st.session_state.get(f"tax_{i}_show_cats"):
+            if st.button("+ Add Allowed Answers", key=f"add_cats_{i}", help="Make the model choose one answer from a fixed list"):
+                st.session_state[f"tax_{i}_show_cats"] = True
+                if st.session_state.get(f"tax_{i}_cat_count", 0) == 0:
+                    st.session_state[f"tax_{i}_cat_count"] = 1
+                    st.session_state[f"tax_{i}_cat_0_name"] = ""
+                    st.session_state[f"tax_{i}_cat_0_desc"] = ""
+                st.rerun()
+        else:
+            with st.container(border=True):
+                col_cat_heading, col_cat_close = st.columns([10, 1])
+                with col_cat_heading:
+                    st.markdown("**Allowed answers**")
+                with col_cat_close:
+                    if st.button(":material/close:", key=f"close_cats_{i}", help="Remove all allowed answers"):
+                        for j in range(st.session_state.get(f"tax_{i}_cat_count", 0)):
+                            for suffix in ("_name", "_desc"):
+                                key = f"tax_{i}_cat_{j}{suffix}"
+                                if key in st.session_state:
+                                    del st.session_state[key]
+                        st.session_state[f"tax_{i}_cat_count"] = 0
+                        st.session_state[f"tax_{i}_show_cats"] = False
+                        st.rerun()
+
+                st.info(
+                    "The model must give **exactly one** of the allowed answers. It cannot choose "
+                    "more than one or write its own text. The app adds a \"Don't Know\" answer "
+                    "automatically. If you do not add allowed answers, the model writes its own "
+                    "text for this field.",
+                    icon=":material/info:",
+                )
+
+                cat_count = st.session_state.get(f"tax_{i}_cat_count", 0)
+                for j in range(cat_count):
+                    col_name, col_desc, col_cdel = st.columns([3, 7, 1])
+                    with col_name:
+                        st.text_input(
+                            f"Cat name {i}_{j}",
+                            key=f"tax_{i}_cat_{j}_name",
+                            label_visibility="collapsed",
+                            placeholder="Answer",
+                        )
+                    with col_desc:
+                        st.text_input(
+                            f"Cat desc {i}_{j}",
+                            key=f"tax_{i}_cat_{j}_desc",
+                            label_visibility="collapsed",
+                            placeholder="Description: when must the model use this answer?",
+                        )
+                    with col_cdel:
+                        if st.button(":material/close:", key=f"del_cat_{i}_{j}", help="Remove this answer"):
+                            _delete_category(i, j)
+                            st.rerun()
+
+                if cat_count < 30:
+                    if st.button("+ Add Answer", key=f"add_cat_{i}"):
+                        st.session_state[f"tax_{i}_cat_{cat_count}_name"] = ""
+                        st.session_state[f"tax_{i}_cat_{cat_count}_desc"] = ""
+                        st.session_state[f"tax_{i}_cat_count"] = cat_count + 1
+                        st.rerun()
+                else:
+                    st.caption("Maximum of 30 answers reached.")
+
+        if i < st.session_state.get("taxonomy_count", 0) - 1:
+            st.markdown("---")
+
+    if st.session_state.get("taxonomy_count", 0) < 20:
+        if st.button("+ Add Field"):
+            idx = st.session_state.get("taxonomy_count", 0)
+            st.session_state[f"tax_{idx}_code"] = ""
+            st.session_state[f"tax_{idx}_definition"] = ""
+            st.session_state.taxonomy_count = idx + 1
+            st.rerun()
+    else:
+        st.caption("Maximum of 20 fields reached.")
+
+    if st.session_state.get("taxonomy_count", 0) == 0:
+        st.warning("At least one output field is required.")
 
     st.divider()
 
@@ -907,132 +1391,23 @@ with tab_prompt:
 
     st.divider()
 
-    # ── Taxonomy section (mandatory) ──
-    st.markdown("**Taxonomy** ✱ — Define the fields you want to extract")
-    st.caption(
-        "Each field becomes a property in the structured JSON output. "
-        "**Code** is the JSON key name (e.g. `revenue`). "
-        "**Definition** tells the model what to extract. "
-        "Optionally, add **Categories** to constrain output to a fixed set of values."
-    )
-
-    for i in range(st.session_state.get("taxonomy_count", 0)):
-        col_code, col_del = st.columns([6, 1])
-        with col_code:
-            st.text_input(
-                f"Code {i + 1}",
-                key=f"tax_{i}_code",
-                label_visibility="collapsed",
-                placeholder="Code (e.g. total_revenue)",
-            )
-        with col_del:
-            if st.button(":material/close:", key=f"del_tax_{i}", help="Remove this field"):
-                _delete_taxonomy_entry(i)
-                st.rerun()
-
-        code_val = st.session_state.get(f"tax_{i}_code", "")
-        if code_val and not _is_valid_code(code_val):
-            st.error("Code must start with a letter and contain only letters, numbers, and underscores.")
-
-        st.text_input(
-            f"Definition {i + 1}",
-            key=f"tax_{i}_definition",
-            label_visibility="collapsed",
-            placeholder="Definition: what should the model extract for this field?",
+    current = _current_prompt()
+    blanks = _find_blanks(current)
+    if blanks:
+        shown = ", ".join(f"`{b}`" for b in blanks[:5]) + (", ..." if len(blanks) > 5 else "")
+        st.warning(
+            f"Your prompt still has blanks to fill in: {shown}. "
+            "Replace each part in [square brackets] with your own text."
         )
 
-        if not st.session_state.get(f"tax_{i}_show_cats"):
-            if st.button("+ Add Categories", key=f"add_cats_{i}", help="Add predefined category options"):
-                st.session_state[f"tax_{i}_show_cats"] = True
-                if st.session_state.get(f"tax_{i}_cat_count", 0) == 0:
-                    st.session_state[f"tax_{i}_cat_count"] = 1
-                    st.session_state[f"tax_{i}_cat_0_name"] = ""
-                    st.session_state[f"tax_{i}_cat_0_desc"] = ""
-                st.rerun()
-        else:
-            with st.container(border=True):
-                col_cat_heading, col_cat_close = st.columns([10, 1])
-                with col_cat_heading:
-                    st.markdown("**Categories**")
-                with col_cat_close:
-                    if st.button(":material/close:", key=f"close_cats_{i}", help="Remove all categories"):
-                        for j in range(st.session_state.get(f"tax_{i}_cat_count", 0)):
-                            for suffix in ("_name", "_desc"):
-                                key = f"tax_{i}_cat_{j}{suffix}"
-                                if key in st.session_state:
-                                    del st.session_state[key]
-                        st.session_state[f"tax_{i}_cat_count"] = 0
-                        st.session_state[f"tax_{i}_show_cats"] = False
-                        st.rerun()
-
-                st.info(
-                    "Categories constrain the model to output **exactly one** of the listed values "
-                    "— it cannot select multiple or write free text when categories are defined. "
-                    "A \"Don't Know\" fallback option is automatically included. "
-                    "If you don't add categories, the field accepts free-text responses.",
-                    icon=":material/info:",
-                )
-
-                cat_count = st.session_state.get(f"tax_{i}_cat_count", 0)
-                for j in range(cat_count):
-                    col_name, col_desc, col_cdel = st.columns([3, 7, 1])
-                    with col_name:
-                        st.text_input(
-                            f"Cat name {i}_{j}",
-                            key=f"tax_{i}_cat_{j}_name",
-                            label_visibility="collapsed",
-                            placeholder="Category name",
-                        )
-                    with col_desc:
-                        st.text_input(
-                            f"Cat desc {i}_{j}",
-                            key=f"tax_{i}_cat_{j}_desc",
-                            label_visibility="collapsed",
-                            placeholder="Category description",
-                        )
-                    with col_cdel:
-                        if st.button(":material/close:", key=f"del_cat_{i}_{j}", help="Remove this category"):
-                            _delete_category(i, j)
-                            st.rerun()
-
-                st.caption("A \"Don't Know\" option is automatically included in the output schema.")
-
-                if cat_count < 30:
-                    if st.button("+ Add Category", key=f"add_cat_{i}"):
-                        st.session_state[f"tax_{i}_cat_{cat_count}_name"] = ""
-                        st.session_state[f"tax_{i}_cat_{cat_count}_desc"] = ""
-                        st.session_state[f"tax_{i}_cat_count"] = cat_count + 1
-                        st.rerun()
-                else:
-                    st.caption("Maximum of 30 categories reached.")
-
-        if i < st.session_state.get("taxonomy_count", 0) - 1:
-            st.markdown("---")
-
-    if st.session_state.get("taxonomy_count", 0) < 20:
-        if st.button("+ Add Field"):
-            idx = st.session_state.get("taxonomy_count", 0)
-            st.session_state[f"tax_{idx}_code"] = ""
-            st.session_state[f"tax_{idx}_definition"] = ""
-            st.session_state.taxonomy_count = idx + 1
-            st.rerun()
-    else:
-        st.caption("Maximum of 20 fields reached.")
-
-    if st.session_state.get("taxonomy_count", 0) == 0:
-        st.warning("At least one taxonomy field is required.")
-
-    st.divider()
-
-    taxonomy = _get_taxonomy()
-    can_save = bool(st.session_state.task_prompt.strip()) and len(taxonomy) > 0
+    can_save = bool(current["task"].strip()) and len(current["taxonomy"]) > 0
     if st.button("Save Prompt", type="primary", disabled=not can_save):
-        st.session_state.saved_prompt = {
-            "task": st.session_state.task_prompt,
-            "rules": _get_rules(),
-            "taxonomy": taxonomy,
-        }
+        st.session_state.saved_prompt = current
         st.success("Prompt saved.")
+
+    has_input = bool(current["task"].strip() or current["rules"] or current["taxonomy"])
+    if has_input and st.session_state.saved_prompt != current:
+        st.warning("You have changes that are not saved.")
 
     if st.session_state.saved_prompt:
         saved = st.session_state.saved_prompt
@@ -1043,34 +1418,104 @@ with tab_prompt:
         st.caption(f"Saved prompt: task ({len(saved['task'])} chars){rule_info}{tax_info}")
 
 
-# ── Tab 4: Trial Run ──────────────────────────────────────────────
+# ── Tab 4: Sample Run ──────────────────────────────────────────────
 
 with tab_trial:
     if not is_ready:
         st.info("Complete Setup, Filter, and Prompt tabs first.")
     else:
         saved = st.session_state.saved_prompt
-        prompt_saved = saved == {
-            "task": st.session_state.task_prompt,
-            "rules": _get_rules(),
-            "taxonomy": _get_taxonomy(),
-        }
+        prompt_saved = saved == _current_prompt()
         if not prompt_saved:
             if saved:
                 st.warning(
                     "Your prompt has changed since it was saved. Click **Save Prompt** at the "
-                    "bottom of **(3) Extraction Prompt** to run a trial with the new prompt."
+                    "bottom of **(3) Extraction Prompt** to run a sample with the new prompt."
                 )
             else:
                 st.warning(
                     "Click **Save Prompt** at the bottom of **(3) Extraction Prompt** "
-                    "before running a trial."
+                    "before you run a sample."
                 )
-        run_trial_clicked = st.button("Run Trial", disabled=not prompt_saved)
-        st.caption(
-            "Runs your extraction prompt against 15 randomly sampled records "
-            "from the filtered set to preview results and estimate full-run cost."
+
+        def _keep(widget_key: str, store_key: str):
+            # Streamlit removes a widget's own key when the widget is not drawn,
+            # so each widget gets its start value from a key that stays.
+            if widget_key not in st.session_state:
+                st.session_state[widget_key] = st.session_state[store_key]
+
+        _keep("sample_mode_w", "sample_mode")
+        st.radio(
+            "Sample type", ["Random", "Targeted"], key="sample_mode_w", horizontal=True,
+            captions=[
+                "15 random reports from the filtered set.",
+                "Reads the most likely reports first, until it finds the hits you ask for.",
+            ],
         )
+        st.session_state.sample_mode = st.session_state["sample_mode_w"]
+        targeted = st.session_state.sample_mode == "Targeted"
+
+        hit_ready = True
+        if targeted:
+            taxonomy_now = _get_taxonomy()
+            codes = [e["code"] for e in taxonomy_now]
+            _keep("hit_field_w", "hit_field")
+            if st.session_state["hit_field_w"] not in codes:
+                st.session_state["hit_field_w"] = codes[0]
+            col_field, col_values = st.columns(2)
+            col_field.selectbox(
+                "Hit field", codes, key="hit_field_w",
+                help="A report is a hit if Claude gives this field one of the hit values.",
+            )
+            st.session_state.hit_field = st.session_state["hit_field_w"]
+            hit_entry = taxonomy_now[codes.index(st.session_state.hit_field)]
+            hit_cats = [c["name"] for c in hit_entry.get("categories", [])]
+            with col_values:
+                if hit_cats:
+                    _keep("hit_values_w", "hit_values")
+                    # Remove values that this field no longer has, before the widget is drawn.
+                    st.session_state["hit_values_w"] = [
+                        v for v in st.session_state["hit_values_w"] if v in hit_cats
+                    ]
+                    st.multiselect(
+                        "Hit values", hit_cats, key="hit_values_w",
+                        placeholder="Select one or more values",
+                    )
+                    st.session_state.hit_values = list(st.session_state["hit_values_w"])
+                    hit_ready = bool(st.session_state.hit_values)
+                else:
+                    st.caption(
+                        "This field has no categories. Any answer except \"Don't Know\" "
+                        "counts as a hit."
+                    )
+            col_hits, col_max = st.columns(2)
+            _keep("hits_to_find_w", "hits_to_find")
+            col_hits.number_input(
+                "Hits to find", min_value=1, max_value=50, step=1, key="hits_to_find_w",
+            )
+            st.session_state.hits_to_find = int(st.session_state["hits_to_find_w"])
+            _keep("max_reports_w", "max_reports")
+            if st.session_state["max_reports_w"] < st.session_state.hits_to_find:
+                st.session_state["max_reports_w"] = st.session_state.hits_to_find
+            col_max.number_input(
+                "Maximum reports to read", min_value=st.session_state.hits_to_find,
+                max_value=200, step=1, key="max_reports_w",
+                help="The search stops at this number, also if it has not found all the hits.",
+            )
+            st.session_state.max_reports = int(st.session_state["max_reports_w"])
+            st.warning(TARGETED_COST_WARNING, icon=":material/payments:")
+            st.warning(TARGETED_SCOPE_WARNING, icon=":material/warning:")
+            if st.session_state.fallback_section:
+                st.caption("Targeted mode searches the primary section only.")
+            if not hit_ready:
+                st.caption("Select at least one hit value to run the sample.")
+
+        run_trial_clicked = st.button("Run Sample", disabled=not (prompt_saved and hit_ready))
+        if not targeted:
+            st.caption(
+                "Runs your extraction prompt against 15 randomly sampled records "
+                "from the filtered set to preview results and estimate full-run cost."
+            )
 
         if run_trial_clicked:
             st.session_state.trial_confirmed = False
@@ -1080,294 +1525,207 @@ with tab_trial:
             st.session_state.trial_confirmed = False
             fp = _filter_params()
             cp = _classify_params()
-            sample_result = database.get_sample_records(
-                fp["years"], fp["countries"], fp["section_name"], fp.get("fallback_section"), n=15,
-            )
-            samples = sample_result["samples"]
-            if not samples:
-                st.error("No records match the current filters.")
+            if targeted:
+                result = _targeted_sample(fp, cp, continue_search=False)
             else:
-                with st.spinner("Running trial on 15 random samples... This may take 30-60 seconds."):
-                    result = _run_async(classifier.run_trial(
-                        samples, cp["model"], cp["task"], cp["rules"],
-                        taxonomy=cp["taxonomy"],
-                        thinking_effort=cp["thinking_effort"],
-                        api_key=st.session_state.api_key,
-                        trial_store=st.session_state.trial_store,
-                    ))
-                result = _check(result)
-                if result:
-                    _run_jev_if_enabled(result, samples, cp)
-                    st.session_state.trial_result = result
-
-                    successful = [s for s in result["samples"] if s["status"] == "success"]
-                    if successful:
-                        avg_in = sum(s["input_tokens"] for s in successful) / len(successful)
-                        avg_out = sum(s["output_tokens"] for s in successful) / len(successful)
-                        record_count = st.session_state.filtered_count["count"]
-                        model_used = successful[0].get("model_used", cp["model"])
-                        prices = match_pricing(model_used)
-                        total_in = avg_in * record_count
-                        total_out = avg_out * record_count
-                        cost_usd = total_in / 1_000_000 * prices["input"] + total_out / 1_000_000 * prices["output"]
-                        st.session_state.cost_estimate = {
-                            "record_count": record_count,
-                            "avg_input_tokens": int(avg_in),
-                            "avg_output_tokens": int(avg_out),
-                            "total_input_tokens": int(total_in),
-                            "total_output_tokens": int(total_out),
-                            "model": model_used,
-                            "model_label": prices["label"],
-                            "input_rate": prices["input"],
-                            "output_rate": prices["output"],
-                            "estimated_cost_usd": round(cost_usd, 2),
-                            "trial_sample_count": len(successful),
-                        }
+                result = _random_sample(
+                    fp, cp, "Running the sample on 15 random reports... This may take 30-60 seconds.",
+                )
+            if result:
+                st.session_state.trial_result = result
 
         if st.session_state.trial_result:
             tr = st.session_state.trial_result
+            tr_targeted = tr.get("mode") == "Targeted"
+            if tr_targeted:
+                if tr.get("retried"):
+                    st.markdown(f"**Classified the same {len(tr['samples'])} reports again.**")
+                else:
+                    st.markdown(
+                        f"**Read {tr['reports_read']} reports, found {tr['hits_found']} hits. "
+                        f"Stopped: {tr['stop_reason']}.**"
+                    )
+                if not targeted:
+                    st.warning(TARGETED_SCOPE_WARNING, icon=":material/warning:")
             c1, c2, c3 = st.columns(3)
-            c1.metric("Succeeded", tr["success_count"])
+            c1.metric("Hits" if tr_targeted else "Succeeded", tr["success_count"])
             c2.metric("Errors", tr["error_count"])
-            c3.metric("Trial Cost", f"A${tr['total_cost_usd'] * USD_TO_AUD:.4f}")
+            c3.metric("Sample Cost", f"A${tr['total_cost_usd'] * USD_TO_AUD:.4f}")
 
             col_retry, col_new = st.columns(2)
             with col_retry:
-                if st.button("Retry Same", use_container_width=True):
+                if st.button("Retry Same", use_container_width=True, disabled=not tr["samples"]):
                     trial_data = st.session_state.trial_store.get(tr["trial_id"])
                     if trial_data:
-                        raw_samples = trial_data["raw_samples"]
-                        cp = _classify_params()
-                        with st.spinner("Re-running trial with same samples..."):
-                            result = _run_async(classifier.run_trial(
-                                raw_samples, cp["model"], cp["task"], cp["rules"],
-                                taxonomy=cp["taxonomy"],
-                                thinking_effort=cp["thinking_effort"],
-                                api_key=st.session_state.api_key,
-                                trial_store=st.session_state.trial_store,
-                            ))
-                        result = _check(result)
+                        result = _classify_samples(
+                            trial_data["raw_samples"], _classify_params(),
+                            "Running the sample again with the same reports...",
+                        )
                         if result:
-                            _run_jev_if_enabled(result, raw_samples, cp)
+                            if tr_targeted:
+                                result.update(mode="Targeted", retried=True)
                             st.session_state.trial_result = result
-                            successful = [s for s in result["samples"] if s["status"] == "success"]
-                            if successful:
-                                avg_in = sum(s["input_tokens"] for s in successful) / len(successful)
-                                avg_out = sum(s["output_tokens"] for s in successful) / len(successful)
-                                record_count = st.session_state.filtered_count["count"]
-                                model_used = successful[0].get("model_used", cp["model"])
-                                prices = match_pricing(model_used)
-                                total_in = avg_in * record_count
-                                total_out = avg_out * record_count
-                                cost_usd = total_in / 1_000_000 * prices["input"] + total_out / 1_000_000 * prices["output"]
-                                st.session_state.cost_estimate = {
-                                    "record_count": record_count,
-                                    "avg_input_tokens": int(avg_in),
-                                    "avg_output_tokens": int(avg_out),
-                                    "total_input_tokens": int(total_in),
-                                    "total_output_tokens": int(total_out),
-                                    "model": model_used,
-                                    "model_label": prices["label"],
-                                    "input_rate": prices["input"],
-                                    "output_rate": prices["output"],
-                                    "estimated_cost_usd": round(cost_usd, 2),
-                                    "trial_sample_count": len(successful),
-                                }
                             st.rerun()
             with col_new:
-                if st.button("New Sample", use_container_width=True):
+                if st.button("New Sample", use_container_width=True, disabled=targeted and not hit_ready):
                     fp = _filter_params()
                     cp = _classify_params()
-                    sample_result = database.get_sample_records(
-                        fp["years"], fp["countries"], fp["section_name"],
-                        fp.get("fallback_section"), n=15,
+                    if targeted:
+                        result = _targeted_sample(fp, cp, continue_search=True)
+                    else:
+                        result = _random_sample(fp, cp, "Running the sample on 15 new reports...")
+                    if result:
+                        st.session_state.trial_result = result
+                        st.rerun()
+
+            if not tr["samples"]:
+                st.info(f"No hits in {tr.get('reports_read', 0)} reports.")
+            else:
+                import pandas as pd
+
+                with st.expander("What do Quotes, Supports and Confidence Scores mean?"):
+                    st.markdown(
+                        "**Quotes:** verbatim excerpts from the report that Claude cites as "
+                        "evidence for each value.\n\n"
+                        "**Supports:** Claude's short argument for how the quotes lead to the "
+                        "value it chose.\n\n"
+                        "**Confidence scores** (only when Jev verification is enabled in "
+                        "**(1) Setup**): TypeSafe's Jev runs a set of checks on each answer and "
+                        "estimates the probability that each one failed, P(wrong). "
+                        "A score is 1 − P(wrong), so 1.0 means confident and 0.0 means almost "
+                        "certainly wrong.\n"
+                        "- `quote_fabrication`: are any of the quotes missing from the document?\n"
+                        "- `argument_support`: do the quotes and argument fail to support the value?\n"
+                        "- `dont_know_validation`: for \"Don't Know\" answers, does the document "
+                        "actually contain enough information to answer?\n"
+                        "- **Rule Compliance**: did the result break one of your rules?\n\n"
+                        "**The score in the table is the weakest link of the chain.** Each "
+                        "confidence column shows the lowest score across all fields (or all rules) "
+                        "in that record, so a single weak field pulls the whole column down. "
+                        "For example, if `revenue` scores 0.95 on quote_fabrication and "
+                        "`roundingunit` scores 0.60, `confidence_quote` shows 0.60.\n"
+                        "- `confidence_quote` → quote_fabrication\n"
+                        "- `confidence_reason` → argument_support\n"
+                        "- `confidence_rule` → Rule Compliance\n"
+                        "- `confidence_DN` → dont_know_validation (N/A if no field was \"Don't Know\")\n\n"
+                        "Open a record under **Details** to see the individual checks for each field."
                     )
-                    samples = sample_result["samples"]
-                    if not samples:
-                        st.error("No records match the current filters.")
-                    else:
-                        with st.spinner("Running trial on 15 new samples..."):
-                            result = _run_async(classifier.run_trial(
-                                samples, cp["model"], cp["task"], cp["rules"],
-                                taxonomy=cp["taxonomy"],
-                                thinking_effort=cp["thinking_effort"],
-                                api_key=st.session_state.api_key,
-                                trial_store=st.session_state.trial_store,
-                            ))
-                        result = _check(result)
-                        if result:
-                            _run_jev_if_enabled(result, samples, cp)
-                            st.session_state.trial_result = result
-                            successful = [s for s in result["samples"] if s["status"] == "success"]
-                            if successful:
-                                avg_in = sum(s["input_tokens"] for s in successful) / len(successful)
-                                avg_out = sum(s["output_tokens"] for s in successful) / len(successful)
-                                record_count = st.session_state.filtered_count["count"]
-                                model_used = successful[0].get("model_used", cp["model"])
-                                prices = match_pricing(model_used)
-                                total_in = avg_in * record_count
-                                total_out = avg_out * record_count
-                                cost_usd = total_in / 1_000_000 * prices["input"] + total_out / 1_000_000 * prices["output"]
-                                st.session_state.cost_estimate = {
-                                    "record_count": record_count,
-                                    "avg_input_tokens": int(avg_in),
-                                    "avg_output_tokens": int(avg_out),
-                                    "total_input_tokens": int(total_in),
-                                    "total_output_tokens": int(total_out),
-                                    "model": model_used,
-                                    "model_label": prices["label"],
-                                    "input_rate": prices["input"],
-                                    "output_rate": prices["output"],
-                                    "estimated_cost_usd": round(cost_usd, 2),
-                                    "trial_sample_count": len(successful),
-                                }
-                            st.rerun()
 
-            import pandas as pd
-
-            with st.expander("What do Quotes, Supports and Confidence Scores mean?"):
-                st.markdown(
-                    "**Quotes:** verbatim excerpts from the report that Claude cites as "
-                    "evidence for each value.\n\n"
-                    "**Supports:** Claude's short argument for how the quotes lead to the "
-                    "value it chose.\n\n"
-                    "**Confidence scores** (only when Jev verification is enabled in "
-                    "**(1) Setup**): TypeSafe's Jev runs a set of checks on each answer and "
-                    "estimates the probability that each one failed, P(wrong). "
-                    "A score is 1 − P(wrong), so 1.0 means confident and 0.0 means almost "
-                    "certainly wrong.\n"
-                    "- `quote_fabrication`: are any of the quotes missing from the document?\n"
-                    "- `argument_support`: do the quotes and argument fail to support the value?\n"
-                    "- `dont_know_validation`: for \"Don't Know\" answers, does the document "
-                    "actually contain enough information to answer?\n"
-                    "- **Rule Compliance**: did the result break one of your rules?\n\n"
-                    "**The score in the table is the weakest link of the chain.** Each "
-                    "confidence column shows the lowest score across all fields (or all rules) "
-                    "in that record, so a single weak field pulls the whole column down. "
-                    "For example, if `revenue` scores 0.95 on quote_fabrication and "
-                    "`roundingunit` scores 0.60, `confidence_quote` shows 0.60.\n"
-                    "- `confidence_quote` → quote_fabrication\n"
-                    "- `confidence_reason` → argument_support\n"
-                    "- `confidence_rule` → Rule Compliance\n"
-                    "- `confidence_DN` → dont_know_validation (N/A if no field was \"Don't Know\")\n\n"
-                    "Open a record under **Details** to see the individual checks for each field."
-                )
-
-            table_rows = []
-            for sample in tr["samples"]:
-                row = {
-                    "Company": sample["company_name"],
-                    "Year": sample["year"],
-                    "Country": sample["country"],
-                    "Section": sample["section_name"],
-                    "Status": sample["status"],
-                }
-                if sample["status"] == "success" and isinstance(sample.get("result"), dict):
-                    for key, value in sample["result"].items():
-                        if key.endswith("_quote") or key.endswith("_supports") or key.endswith("_reasoning"):
-                            continue
-                        row[key] = value
-                conf = sample.get("confidence")
-                if conf and not conf.get("skipped"):
-                    if conf.get("confidence_rule") is not None:
-                        row["confidence_rule"] = conf["confidence_rule"]
-                    if conf.get("confidence_quote") is not None:
-                        row["confidence_quote"] = conf["confidence_quote"]
-                    if conf.get("confidence_reason") is not None:
-                        row["confidence_reason"] = conf["confidence_reason"]
-                    dn = compute_dn_confidence(conf.get("field_confidences", {}))
-                    # All strings: mixing "N/A" with floats breaks Arrow serialisation.
-                    row["confidence_DN"] = "N/A" if dn is None else str(dn)
-                table_rows.append(row)
-
-            df = pd.DataFrame(table_rows)
-            st.dataframe(df, use_container_width=True, hide_index=True)
-
-            st.subheader("Details")
-            for i, sample in enumerate(tr["samples"]):
-                label = f"{sample['company_name']} ({sample['year']})"
-                conf = sample.get("confidence")
-                with st.expander(label):
+                table_rows = []
+                for sample in tr["samples"]:
+                    row = {
+                        "Company": sample["company_name"],
+                        "Year": sample["year"],
+                        "Country": sample["country"],
+                        "Section": sample["section_name"],
+                        "Status": sample["status"],
+                    }
                     if sample["status"] == "success" and isinstance(sample.get("result"), dict):
-                        result_data = sample["result"]
-                        verified = bool(conf) and not conf.get("skipped")
+                        for key, value in sample["result"].items():
+                            if key.endswith("_quote") or key.endswith("_supports") or key.endswith("_reasoning"):
+                                continue
+                            row[key] = value
+                    conf = sample.get("confidence")
+                    if conf and not conf.get("skipped"):
+                        if conf.get("confidence_rule") is not None:
+                            row["confidence_rule"] = conf["confidence_rule"]
+                        if conf.get("confidence_quote") is not None:
+                            row["confidence_quote"] = conf["confidence_quote"]
+                        if conf.get("confidence_reason") is not None:
+                            row["confidence_reason"] = conf["confidence_reason"]
+                        dn = compute_dn_confidence(conf.get("field_confidences", {}))
+                        # All strings: mixing "N/A" with floats breaks Arrow serialisation.
+                        row["confidence_DN"] = "N/A" if dn is None else str(dn)
+                    table_rows.append(row)
 
-                        if conf and conf.get("skipped"):
-                            reason = conf.get("skip_reason", "unknown")
-                            tokens = conf.get("document_tokens_estimated", 0)
-                            st.warning(
-                                f"Verification skipped — {reason} "
-                                f"(estimated {tokens:,} tokens)"
-                            )
-                        elif conf and conf.get("trimmed"):
-                            kept = len(conf.get("sections_kept", []))
-                            total = conf.get("sections_total", 0)
-                            trimmed_tok = conf.get("document_tokens_trimmed", 0)
-                            original_tok = conf.get("document_tokens_original", 0)
-                            st.info(
-                                f"Verified on {kept} of {total} document sections "
-                                f"({trimmed_tok:,} / {original_tok:,} tokens)"
-                            )
+                df = pd.DataFrame(table_rows)
+                st.dataframe(df, use_container_width=True, hide_index=True)
 
-                        # One block per field: quotes, supports, then its Jev checks.
-                        # Taxonomy order comes from the result keys (they follow the schema).
-                        fc = conf["field_confidences"] if verified else {}
-                        fields = [
-                            k for k in result_data
-                            if f"{k}_quote" in result_data or f"{k}_supports" in result_data
-                        ]
-                        fields += [k for k in fc if k not in fields]
-                        for field in fields:
-                            field_conf = fc.get(field)
-                            heading = f"**{field}**"
-                            lines = []
-                            quote = result_data.get(f"{field}_quote", "")
-                            supports = result_data.get(f"{field}_supports", "")
-                            if quote:
-                                lines.append(f"- **Quotes:** {quote}")
-                            if supports:
-                                lines.append(f"- **Supports:** {supports}")
-                            for check in (field_conf or {}).get("checks", []):
-                                lines.append(
-                                    f"- `{check['check']}` P(wrong): {check['p_wrong']:.3f}"
+                st.subheader("Details")
+                for i, sample in enumerate(tr["samples"]):
+                    label = f"{sample['company_name']} ({sample['year']})"
+                    conf = sample.get("confidence")
+                    with st.expander(label):
+                        if sample["status"] == "success" and isinstance(sample.get("result"), dict):
+                            result_data = sample["result"]
+                            verified = bool(conf) and not conf.get("skipped")
+
+                            if conf and conf.get("skipped"):
+                                reason = conf.get("skip_reason", "unknown")
+                                tokens = conf.get("document_tokens_estimated", 0)
+                                st.warning(
+                                    f"Verification skipped — {reason} "
+                                    f"(estimated {tokens:,} tokens)"
                                 )
-                            st.markdown("\n\n".join([heading, "\n".join(lines)]))
+                            elif conf and conf.get("trimmed"):
+                                kept = len(conf.get("sections_kept", []))
+                                total = conf.get("sections_total", 0)
+                                trimmed_tok = conf.get("document_tokens_trimmed", 0)
+                                original_tok = conf.get("document_tokens_original", 0)
+                                st.info(
+                                    f"Verified on {kept} of {total} document sections "
+                                    f"({trimmed_tok:,} / {original_tok:,} tokens)"
+                                )
 
-                        if verified:
-                            rule_checks = conf.get("rule_checks", [])
-                            if rule_checks:
-                                st.markdown("**Rule Compliance**")
-                                for rc in rule_checks:
-                                    st.markdown(
-                                        f"- P(wrong): {rc['p_wrong']:.3f} — {rc['rule']}"
+                            # One block per field: quotes, supports, then its Jev checks.
+                            # Taxonomy order comes from the result keys (they follow the schema).
+                            fc = conf["field_confidences"] if verified else {}
+                            fields = [
+                                k for k in result_data
+                                if f"{k}_quote" in result_data or f"{k}_supports" in result_data
+                            ]
+                            fields += [k for k in fc if k not in fields]
+                            for field in fields:
+                                field_conf = fc.get(field)
+                                heading = f"**{field}**"
+                                lines = []
+                                quote = result_data.get(f"{field}_quote", "")
+                                supports = result_data.get(f"{field}_supports", "")
+                                if quote:
+                                    lines.append(f"- **Quotes:** {quote}")
+                                if supports:
+                                    lines.append(f"- **Supports:** {supports}")
+                                for check in (field_conf or {}).get("checks", []):
+                                    lines.append(
+                                        f"- `{check['check']}` P(wrong): {check['p_wrong']:.3f}"
                                     )
+                                st.markdown("\n\n".join([heading, "\n".join(lines)]))
 
-                    thinking_text = sample.get("thinking_text", "")
-                    if thinking_text:
-                        st.markdown("**Claude Thinking**")
-                        with st.container(height=300):
-                            st.markdown(thinking_text)
+                            if verified:
+                                rule_checks = conf.get("rule_checks", [])
+                                if rule_checks:
+                                    st.markdown("**Rule Compliance**")
+                                    for rc in rule_checks:
+                                        st.markdown(
+                                            f"- P(wrong): {rc['p_wrong']:.3f} — {rc['rule']}"
+                                        )
 
-                    source_text = sample.get("source_text", "")
-                    if source_text:
-                        word_count = len(source_text.split())
-                        st.markdown("**Source Text**")
-                        st.caption(f"{word_count:,} words")
-                        with st.container(height=400):
-                            st.markdown(source_text)
-                    else:
-                        st.info("Source text not available.")
+                        thinking_text = sample.get("thinking_text", "")
+                        if thinking_text:
+                            st.markdown("**Claude Thinking**")
+                            with st.container(height=300):
+                                st.markdown(thinking_text)
+
+                        source_text = sample.get("source_text", "")
+                        if source_text:
+                            word_count = len(source_text.split())
+                            st.markdown("**Source Text**")
+                            st.caption(f"{word_count:,} words")
+                            with st.container(height=400):
+                                st.markdown(source_text)
+                        else:
+                            st.info("Source text not available.")
 
 
 # ── Tab 5: Cost Estimate ──────────────────────────────────────────
 
 with tab_cost:
     if not st.session_state.cost_estimate:
-        st.info("Run a trial first — cost is estimated from actual API usage.")
+        st.info("Run a sample first (tab 4). The cost estimate uses the actual API usage of the sample.")
     else:
         ce = st.session_state.cost_estimate
         st.caption(
-            f"Based on {ce['trial_sample_count']} successful trial samples, "
+            f"Based on {ce['trial_sample_count']} successful sample reports, "
             "extrapolated to the full filtered record count."
         )
 
@@ -1386,8 +1744,11 @@ with tab_cost:
 # ── Tab 6: Full Run ───────────────────────────────────────────────
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _cached_content_stats(years, countries, section_name, fallback_section):
-    return database.get_content_stats(list(years), list(countries), section_name, fallback_section or None)
+def _cached_content_stats(years, countries, section_name, fallback_section, companies=()):
+    return database.get_content_stats(
+        list(years), list(countries), section_name, fallback_section or None,
+        companies=list(companies),
+    )
 
 
 def _current_run():
@@ -1438,7 +1799,8 @@ def _trial_matches(cfg) -> list[dict]:
     )
     if trial_cfg.config_id != cfg.config_id:
         return []
-    return [s for s in tr["samples"] if s["status"] == "success"]
+    # A Targeted sample shows hits only, but every report it read gives usage figures.
+    return [s for s in tr.get("all_results") or tr["samples"] if s["status"] == "success"]
 
 
 def _run_estimates(run) -> dict:
@@ -1453,12 +1815,13 @@ def _run_estimates(run) -> dict:
             "avg_input": sum(s["input_tokens"] for s in trial_ok) / n,
             "avg_output": sum(s["output_tokens"] for s in trial_ok) / n,
             "avg_latency_s": sum(s["latency_ms"] for s in trial_ok) / n / 1000,
-            "source": f"your trial run ({n} samples)",
+            "source": f"your sample run ({n} reports)",
         }
     f = run.config.filters
     content = _cached_content_stats(
         tuple(f.get("years", [])), tuple(f.get("countries", [])),
         f.get("section_name", ""), f.get("fallback_section", ""),
+        tuple(f.get("companies", [])),
     )
     est = estimate_cost(
         1, content["avg_length"], run.config.model, run.config.task,
@@ -1469,7 +1832,7 @@ def _run_estimates(run) -> dict:
         "avg_input": est["avg_input_tokens_per_record"],
         "avg_output": est["estimated_output_tokens_per_record"],
         "avg_latency_s": 60.0,
-        "source": "default assumptions (no trial with these settings)",
+        "source": "default assumptions (no sample run with these settings)",
     }
 
 
@@ -1592,10 +1955,10 @@ with tab_full:
             ("Filters return records (Filter Records)", bool(
                 st.session_state.filtered_count and st.session_state.filtered_count["count"] > 0
             )),
-            ("Extraction prompt and taxonomy set (Extraction Prompt)", bool(
+            ("Extraction prompt and output fields set (Extraction Prompt)", bool(
                 st.session_state.task_prompt.strip() and _get_taxonomy()
             )),
-            ("Trial run done (Trial Run)", st.session_state.trial_result is not None),
+            ("Sample run done (Sample Run)", st.session_state.trial_result is not None),
         ]
         for label, ok in checks:
             st.markdown(f"{'✅' if ok else '❌'} {label}")
@@ -1604,6 +1967,7 @@ with tab_full:
             with st.spinner("Building the run table from your filters (can take ~30 s)..."):
                 rows = database.get_filtered_rowids(
                     fp["years"], fp["countries"], fp["section_name"], fp.get("fallback_section") or None,
+                    companies=fp.get("companies"),
                 )
                 cfg = RunConfig.from_params(_classify_params())
                 new_run = batch_processor.BatchRun(BatchTable.new(rows, cfg), cfg)
@@ -1647,6 +2011,8 @@ with tab_full:
                 f" · {', '.join(str(y) for y in f.get('years', []))}"
                 f" · {', '.join(f.get('countries', []))} · {f.get('section_name', '')}"
             )
+            if f.get("companies"):
+                filter_text += f" · {_companies_text(f['companies'])}"
         st.caption(
             f"{match_pricing(cfg.model)['label']} · {cfg.thinking_effort} effort · "
             f"{counts['total']:,} rows · config {cfg.config_id}{filter_text}"
